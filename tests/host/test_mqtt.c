@@ -53,11 +53,36 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t e, EventBits_t bits, int clea
     unsigned result = e->bits; pthread_mutex_unlock(&e->lock); return result;
 }
 
+static atomic_int subscribed, delivered;
+static void received(const char *payload, size_t length, bool retained, void *context) {
+    (void)context;
+    assert(length==4 && !strcmp(payload,"ping") && retained);
+    atomic_fetch_add(&delivered,1);
+}
+int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client,const char *topic,int qos) {
+    (void)client; assert(!strcmp(topic,"test/command") && qos==1);
+    return atomic_fetch_add(&subscribed,1);
+}
+esp_err_t esp_mqtt_client_disconnect(esp_mqtt_client_handle_t client) { (void)client; return ESP_OK; }
+static void messages(struct client *client) {
+    esp_mqtt_event_t event={.client=client,.topic="test/command",.topic_len=12,
+        .data="pi",.data_len=2,.total_data_len=4,.retain=true};
+    client->callback(NULL,NULL,MQTT_EVENT_DATA,&event);
+    event.topic=NULL; event.topic_len=0; event.current_data_offset=2; event.data="ng";
+    client->callback(NULL,NULL,MQTT_EVENT_DATA,&event);
+    // Oversized and out-of-order fragments must not invoke application code.
+    event.current_data_offset=0; event.topic="test/command"; event.topic_len=12;
+    event.total_data_len=2000;
+    client->callback(NULL,NULL,MQTT_EVENT_DATA,&event);
+    event.total_data_len=4; event.current_data_offset=2;
+    client->callback(NULL,NULL,MQTT_EVENT_DATA,&event);
+}
 static void *client_thread(void *arg) {
     struct client *client = arg;
-    esp_mqtt_event_t event = {client};
+    esp_mqtt_event_t event = {.client=client};
     pause_briefly();
     client->callback(NULL, NULL, client->fail ? MQTT_EVENT_ERROR : MQTT_EVENT_CONNECTED, &event);
+    if (!client->fail) messages(client);
     return NULL;
 }
 esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *config) {
@@ -121,7 +146,8 @@ static void *publisher(void *arg) {
 }
 
 int main(void) {
-    const mqtt_connection_options_t options = {"test", "public-test-ca", "test/availability"};
+    const mqtt_connection_options_t options = {.device_id="test", .ca_certificate="public-test-ca",
+        .availability_topic="test/availability", .command_topic="test/command", .on_message=received};
     assert(mqtt_connection_initialize(&options) == ESP_OK);
     assert(mqtt_connection_start_saved() == ESP_ERR_NVS_NOT_FOUND);
     assert(mqtt_connection_test_and_save(NULL, 8883, "user", "pass") == ESP_ERR_INVALID_ARG);
@@ -144,6 +170,8 @@ int main(void) {
     assert(!mqtt_connection_is_connected());
     assert(mqtt_connection_start_saved() == ESP_ERR_NVS_NOT_FOUND);
     assert(atomic_load(&published) > 100);
+    assert(atomic_load(&subscribed)>1);
+    assert(atomic_load(&delivered)==atomic_load(&subscribed));
     puts("MQTT lifecycle: 100 replacements with concurrent publishing, rollback, forget and TLS configuration passed");
     return 0;
 }

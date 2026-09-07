@@ -28,6 +28,39 @@ static esp_mqtt_client_handle_t s_client;
 static saved_mqtt_config_t s_config;
 static mqtt_connection_options_t s_options;
 static atomic_uint s_generation;
+static char s_incoming[1024];
+static size_t s_received, s_expected;
+static bool s_retained;
+
+static void receive_message(esp_mqtt_event_handle_t event)
+{
+    if (!s_options.on_message) return;
+    if (event->current_data_offset == 0) {
+        s_received = s_expected = 0;
+        if (!event->topic || event->topic_len != (int)strlen(s_options.command_topic) ||
+            memcmp(event->topic, s_options.command_topic, event->topic_len) ||
+            event->total_data_len <= 0 || event->total_data_len >= (int)sizeof(s_incoming)) return;
+        s_expected = event->total_data_len;
+        s_retained = event->retain;
+    }
+    if (!s_expected) return;
+    if (!event->data || event->data_len <= 0 ||
+        event->current_data_offset != (int)s_received ||
+        event->total_data_len != (int)s_expected ||
+        (size_t)event->data_len > s_expected - s_received) {
+        s_received = s_expected = 0;
+        return;
+    }
+    memcpy(s_incoming + s_received, event->data, event->data_len);
+    s_received += event->data_len;
+    if (s_received == s_expected) {
+        s_incoming[s_received] = 0;
+        // Embedded NUL would make parsers disagree about message length.
+        if (!memchr(s_incoming, 0, s_received))
+            s_options.on_message(s_incoming, s_received, s_retained, s_options.message_context);
+        s_received = s_expected = 0;
+    }
+}
 
 static esp_err_t load_config(saved_mqtt_config_t *configuration)
 {
@@ -92,9 +125,18 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupClearBits(s_mqtt_events, MQTT_FAILED_BIT);
         esp_mqtt_client_enqueue(event->client, s_options.availability_topic,
                                 "online", 0, 1, true, true);
+        s_received = s_expected = 0;
+        if (s_options.command_topic && esp_mqtt_client_subscribe(event->client, s_options.command_topic, 1) < 0) {
+            xEventGroupSetBits(s_mqtt_events, MQTT_FAILED_BIT);
+            esp_mqtt_client_disconnect(event->client);
+            return;
+        }
         atomic_fetch_add(&s_generation, 1);
         xEventGroupSetBits(s_mqtt_events, MQTT_CONNECTED_BIT);
+    } else if (id == MQTT_EVENT_DATA) {
+        receive_message(event);
     } else if (id == MQTT_EVENT_DISCONNECTED) {
+        s_received = s_expected = 0;
         xEventGroupClearBits(s_mqtt_events, MQTT_CONNECTED_BIT);
     } else if (id == MQTT_EVENT_ERROR) {
         xEventGroupSetBits(s_mqtt_events, MQTT_FAILED_BIT);
@@ -126,6 +168,7 @@ static esp_err_t start_config(const saved_mqtt_config_t *configuration,
         .credentials.client_id = s_options.device_id,
         .credentials.username = s_config.username,
         .credentials.authentication.password = s_config.password,
+        .outbox.limit = s_options.outbox_limit_bytes,
         .session.last_will.topic = s_options.availability_topic,
         .session.last_will.msg = "offline",
         .session.last_will.qos = 1,
@@ -168,6 +211,10 @@ esp_err_t mqtt_connection_initialize(const mqtt_connection_options_t *options)
         !options->availability_topic || !options->availability_topic[0]) {
         return ESP_ERR_INVALID_ARG;
     }
+    if ((options->command_topic == NULL) != (options->on_message == NULL) ||
+        (options->command_topic && (!options->command_topic[0] ||
+         strlen(options->command_topic) > 127 || strpbrk(options->command_topic, "+#"))))
+        return ESP_ERR_INVALID_ARG;
     s_options = *options;
     s_lock = xSemaphoreCreateMutex();
     s_mqtt_events = xEventGroupCreate();

@@ -8,10 +8,20 @@
 #define MQTT_USERNAME_MAX_BYTES 63
 #define MQTT_PASSWORD_MAX_BYTES 95
 
+// Invoked on the MQTT task with a complete, bounded message. Copy/queue only;
+// never block or call client lifecycle/publish APIs here. Pointers expire on return.
+typedef void (*mqtt_message_handler_t)(const char *payload, size_t length,
+                                       bool retained, void *context);
+
 typedef struct {
     const char *device_id;
     const char *ca_certificate;
     const char *availability_topic;
+    // Optional exact topic (no wildcards); lifetime must cover the client.
+    const char *command_topic;
+    mqtt_message_handler_t on_message;
+    void *message_context;
+    uint32_t outbox_limit_bytes; // 0 preserves ESP-MQTT default; nonzero bounds queued bytes
 } mqtt_connection_options_t;
 
 // Singleton, process lifetime. Options are copied; strings must remain valid.

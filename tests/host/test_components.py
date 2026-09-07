@@ -37,6 +37,12 @@ class Sensor(c.Structure):
                 ("id", "name", "value_template", "unit", "device_class", "state_class", "entity_category")]
 
 
+class Entity(c.Structure):
+    _fields_ = [("sensor", Sensor), ("unique_id", c.c_char_p),
+                ("availability_template", c.c_char_p), ("json_attributes_template", c.c_char_p),
+                ("expire_after_s", c.c_uint), ("binary", c.c_bool)]
+
+
 lib.ha_discovery_sensor.argtypes = [c.POINTER(Device), c.POINTER(Sensor),
                                    c.c_void_p, c.c_size_t, c.c_void_p, c.c_size_t]
 lib.ha_discovery_sensor.restype = c.c_int
@@ -59,6 +65,24 @@ class Components(unittest.TestCase):
         self.assertEqual(topic.raw[topic_size:], b"!" * 8)
         self.assertEqual(payload.raw[payload_size:], b"!" * 8)
         return result, topic.value, payload.value
+
+    def test_extended_entity_bounds_and_binary_discovery(self):
+        entity = Entity(self.sensor, b'custom"id', b"{{ value_json.valid }}", None, 3, True)
+        for size in range(1, 1000):
+            topic = c.create_string_buffer(200)
+            output = c.create_string_buffer(b"!" * (size + 8), size + 8)
+            error = lib.ha_discovery_entity(c.byref(self.device), c.byref(entity),
+                                             topic, 200, output, size)
+            self.assertEqual(output.raw[size:], b"!" * 8)
+            if error == 0:
+                data = json.loads(output.value)
+                self.assertEqual(data["unique_id"], 'custom"id')
+                self.assertEqual(data["payload_on"], "ON")
+                self.assertEqual(data["expire_after"], 3)
+                self.assertIn(b"/binary_sensor/", topic.value)
+            else:
+                self.assertEqual(error, 0x104)
+                self.assertEqual(output.value, b"")
 
     def test_wifi_all_boundaries(self):
         for ssid_size in range(0, 35):
