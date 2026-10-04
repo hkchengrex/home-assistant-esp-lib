@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "driver/usb_serial_jtag.h"
-#include "esp_rom_usb_serial.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,13 +12,19 @@
 #include "mqtt_connection.h"
 
 static bool (*s_wait_for_time)(void);
+static bool (*s_command_handler)(const char *);
+
+void usb_provisioning_set_command_handler(bool (*handler)(const char *))
+{
+    s_command_handler = handler;
+}
 
 esp_err_t usb_provisioning_initialize(bool (*wait_for_time)(void))
 {
     if (wait_for_time == NULL) return ESP_ERR_INVALID_ARG;
     s_wait_for_time = wait_for_time;
     usb_serial_jtag_driver_config_t config = {
-        .rx_buffer_size = 1024, .tx_buffer_size = 1024,
+        .rx_buffer_size = 1024, .tx_buffer_size = 4096,
     };
     return usb_serial_jtag_driver_install(&config);
 }
@@ -38,8 +43,10 @@ void usb_provisioning_send(const char *format, ...)
     if ((size_t)length >= sizeof(message)) {
         length = sizeof(message) - 1;
     }
-    for (int index = 0; index < length; ++index) {
-        esp_rom_usb_serial_putc(message[index]);
+    // One driver-owned write keeps command replies and optional diagnostic
+    // lines intact. Never block station startup on an unopened USB terminal.
+    if (length > 0) {
+        (void)usb_serial_jtag_write_bytes(message, length, pdMS_TO_TICKS(20));
     }
 }
 
@@ -214,6 +221,8 @@ void usb_provisioning_run(void)
         } else if (strcmp(command, "HELP") == 0) {
             usb_provisioning_send("COMMANDS WIFI_SETUP WIFI_STATUS WIFI_FORGET MQTT_SETUP "
                      "MQTT_STATUS MQTT_FORGET DEVICE_INFO HELP\n");
+        } else if (s_command_handler && s_command_handler(command)) {
+            // Application-specific diagnostic command handled.
         } else if (command[0] != '\0') {
             usb_provisioning_send("WIFI_ERROR unknown-command\n");
         }
